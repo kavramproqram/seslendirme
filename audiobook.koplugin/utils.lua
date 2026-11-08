@@ -1,0 +1,759 @@
+--[[--
+Shared Utility Functions
+Common helpers used across the audiobook plugin modules.
+Eliminates duplication of commandExists, ws, countSyllables.
+
+@module utils
+--]]
+
+local Utils = {}
+
+--- Check if a command exists on the system PATH.
+-- @param cmd string  Command name (e.g. "piper", "espeak-ng")
+-- @return boolean
+function Utils.commandExists(cmd)
+    local handle = io.popen("which " .. cmd .. " 2>/dev/null")
+    if handle then
+        local result = handle:read("*a")
+        handle:close()
+        return result and result ~= ""
+    end
+    return false
+end
+
+--- Normalise whitespace: collapse runs to single space, trim edges.
+-- @param s string
+-- @return string
+function Utils.ws(s)
+    if not s then return "" end
+    return s:gsub("%s+", " "):match("^%s*(.-)%s*$")
+end
+
+--- Normalize text for matching against crengine-rendered text.
+-- SMIL/source text and rendered text differ systematically: curly quotes,
+-- dashes, non-breaking spaces, zero-width chars, and (in some production
+-- pipelines) runs of straight apostrophes used as an escaping convention,
+-- e.g. "June'''s" for "June's".  Matching only, never for display.
+-- @param s string
+-- @return string
+function Utils.normalizeForMatching(s)
+    if not s then return "" end
+    return s
+        :gsub("[\n\r]+", " ")
+        :gsub("%s+", " ")
+        :gsub("\226\128[\152-\155]", "'")    -- curly quotes U+2018-U+201B → straight '
+        :gsub("\226\128[\156-\159]", '"')    -- curly double quotes U+201C-U+201F → straight "
+        :gsub("\194\171", '"')               -- « guillemet → straight "
+        :gsub("\194\187", '"')               -- » guillemet → straight "
+        :gsub("\226\128[\147-\148]", "-")    -- en/em-dash → hyphen
+        :gsub("\226\128\166", "...")         -- ellipsis
+        :gsub("\194\160", " ")               -- non-breaking space → space
+        :gsub("\194\173", "")                -- soft hyphen removed
+        :gsub("\226\128[\139\169]", "")      -- zero-width chars removed
+        :gsub("\239\187\191", "")            -- BOM removed
+        :gsub("''+", "'")                    -- apostrophe-run artifact
+        :gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+--- Count the number of syllables in an English word (heuristic).
+-- @param word string
+-- @return number  Syllable count (minimum 1)
+function Utils.countSyllables(word)
+    if not word or word == "" then return 1 end
+
+    word = word:lower()
+    local count = 0
+    local prev_vowel = false
+
+    for i = 1, #word do
+        local char = word:sub(i, i)
+        local is_vowel = char:match("[aeiouy]")
+        if is_vowel and not prev_vowel then
+            count = count + 1
+        end
+        prev_vowel = is_vowel
+    end
+
+    -- Silent-e rule
+    if word:sub(-1) == "e" and count > 1 then
+        count = count - 1
+    end
+
+    return math.max(count, 1)
+end
+
+--- Normalize a directory path: collapse double slashes, strip trailing slashes.
+-- @param path string|nil
+-- @return string  Normalized path without trailing slash
+function Utils.normalizeDirPath(path)
+    if not path then return "." end
+    path = path:gsub("//+", "/")
+    path = path:gsub("/+$", "")
+    if path == "" then return "." end
+    return path
+end
+
+-- Kindle generations with a built-in speaker on a real ALSA codec and no
+-- Bluetooth at all (2007-2011).  KOReader flavors: the first three run the
+-- kindle-legacy build, the last three the "kindle" (kindle5 toolchain,
+-- Cortex-A8 softfp) build.  PW2 (model "KindlePaperWhite2") is the first
+-- speakerless generation, so everything from there on must NOT match.
+Utils.LEGACY_KINDLE_MODELS = {
+    Kindle2 = true,
+    KindleDXG = true,
+    Kindle3 = true,
+    Kindle4 = true,
+    KindleTouch = true,
+    KindlePaperWhite = true,
+}
+
+local _legacy_kindle_model = nil
+local _kindle_kernel_2_6 = nil
+
+--- True when the running kernel is from the 2.6 series (every 2007-2011
+--- Kindle firmware).  Cached for the session.
+-- @return boolean
+local function kernelIs26()
+    if _kindle_kernel_2_6 ~= nil then return _kindle_kernel_2_6 end
+    _kindle_kernel_2_6 = false
+    local h = io.popen("uname -r 2>/dev/null")
+    if h then
+        local rel = h:read("*l") or ""
+        h:close()
+        _kindle_kernel_2_6 = rel:match("^2%.6") ~= nil
+    end
+    return _kindle_kernel_2_6
+end
+
+--- True when the current Kindle is a 2007-2011 speaker model.  Matched
+--- first against the KOReader model list; when KOReader cannot name the
+--- device at all (nil or "unknown" model, seen on a KT4 with fw 5.3.x,
+--- issue #85), classify by evidence: the speaker generation is the only
+--- Kindle family that still exposes a real ALSA card, and it runs a 2.6
+--- kernel.  PW2+ hardware has no ALSA card and 3.x+ kernels, so both
+--- checks together cannot false-positive there.
+-- @return boolean
+function Utils.isLegacyKindleModel()
+    if _legacy_kindle_model ~= nil then return _legacy_kindle_model end
+    _legacy_kindle_model = false
+    local ok, Device = pcall(require, "device")
+    if ok and Device and Device.model then
+        _legacy_kindle_model = Utils.LEGACY_KINDLE_MODELS[Device.model] or false
+    end
+    if not _legacy_kindle_model and ok and Device
+        and Device.isKindle and Device:isKindle() then
+        local model = Device.model
+        if not model or model == "unknown" then
+            if Utils.probeKindleAlsaCard() and kernelIs26() then
+                _legacy_kindle_model = true
+            end
+        end
+    end
+    return _legacy_kindle_model
+end
+
+local _kindle_alsa_card = nil
+local _kindle_alsa_probed = false
+
+--- Probe once for a usable ALSA playback device (old Kindles expose their
+--- speaker codec directly; PW2+ report "no soundcards").  Cached for the
+--- session so the probe runs at most once.
+-- @return string|false  ALSA device argument (e.g. "plughw:0,0") or false
+function Utils.probeKindleAlsaCard()
+    if _kindle_alsa_probed then return _kindle_alsa_card end
+    _kindle_alsa_probed = true
+    _kindle_alsa_card = false
+    local h = io.popen("aplay -l 2>/dev/null")
+    if h then
+        local out = h:read("*a") or ""
+        h:close()
+        if not out:find("no soundcards", 1, true) then
+            local card, dev = out:match("card (%d+):.+device (%d+):")
+            if card and dev then
+                _kindle_alsa_card = "plughw:" .. card .. "," .. dev
+            end
+        end
+    end
+    return _kindle_alsa_card
+end
+
+--- Fold a token for alignment: lowercase, drop apostrophes/punctuation, strip
+--- a trailing hyphen (CRe line-break hyphenation). Matching only.
+function Utils.foldWord(w)
+    if not w or w == "" then return "" end
+    w = w:lower()
+    w = w:gsub("\195\137", "\195\169") -- É → é
+    w = w:gsub("\195\136", "\195\168") -- È → è
+    w = w:gsub("\195\138", "\195\170") -- Ê → ê
+    w = w:gsub("\195\128", "\195\160") -- À → à
+    w = w:gsub("\195\135", "\195\167") -- Ç → ç
+    w = w:gsub("'", ""):gsub("\226\128\153", "")
+    w = w:gsub("^%p+", ""):gsub("%p+$", "")
+    w = w:gsub("%-$", "")
+    return w
+end
+
+--- Tokens of `s` with original character spans. Merges a hyphenated line-break
+--- ("exem-" + "ple") and a French elision ("L'" + "homme").
+function Utils.tokenizeForAlign(s)
+    local toks = {}
+    if not s or s == "" then return toks end
+    local pos = 1
+    while true do
+        local a, b = s:find("%S+", pos)
+        if not a then break end
+        local raw = s:sub(a, b)
+        pos = b + 1
+        if raw:sub(-1) == "-" then
+            local a2, b2 = s:find("%S+", pos)
+            if a2 then
+                raw = raw:sub(1, -2) .. s:sub(a2, b2)
+                b = b2
+                pos = b2 + 1
+            end
+        -- Elision markers ("L'", "d'", "qu'") always end WITH the
+        -- apostrophe as their last character. The old check (contains an
+        -- apostrophe and is at most 4 chars) also matched ordinary
+        -- contractions ("it's", "I'm", "he's", "I'll"), merging them with
+        -- the following word and inflating the compared word count, which
+        -- pushed highlights past the sentence end.
+        elseif raw:sub(-1) == "'" then
+            local a2, b2 = s:find("%S+", pos)
+            if a2 then
+                raw = raw .. s:sub(a2, b2)
+                b = b2
+                pos = b2 + 1
+            end
+        end
+        local fold = Utils.foldWord(raw)
+        if fold ~= "" then
+            toks[#toks + 1] = { fold = fold, a = a, b = b }
+        end
+    end
+    return toks
+end
+
+--- Align `words` (SMIL) onto `page` (rendered). Returns
+--- first_word, last_word, char_start, char_end in `page`, or nil.
+--- Bookends the first and last matching words so a hyphenation hole in the
+--- middle does not drop the start or end of the phrase.
+function Utils.alignSentenceOnPage(words, page)
+    if not words or #words == 0 or not page or page == "" then return nil end
+    local toks = Utils.tokenizeForAlign(page)
+    if #toks == 0 then return nil end
+    local sent = {}
+    for i = 1, #words do
+        sent[i] = Utils.foldWord(words[i])
+    end
+
+    local function findFrom(i, min_p, max_p)
+        local f = sent[i]
+        if not f or f == "" then return nil end
+        local hi = max_p or #toks
+        for p = min_p, hi do
+            local tf = toks[p].fold
+            if tf == f then return p end
+            if #tf >= 3 and #f >= 3 then
+                if f:sub(1, #tf) == tf or tf:sub(1, #f) == f then return p end
+            end
+        end
+        return nil
+    end
+
+    local first_w, first_p
+    for i = 1, #words do
+        local p = findFrom(i, 1, #toks)
+        if p then
+            first_w, first_p = i, p
+            break
+        end
+    end
+    if not first_w then return nil end
+
+    local last_w, last_p = first_w, first_p
+    local p_cur = first_p
+    for i = first_w + 1, #words do
+        if sent[i] ~= "" then
+            local gap = (#sent[i] <= 3) and 5 or 12
+            if i >= #words - 1 then gap = 20 end
+            local p = findFrom(i, p_cur + 1, math.min(#toks, p_cur + gap))
+            if p then
+                last_w, last_p = i, p
+                p_cur = p
+            end
+        end
+    end
+    if last_p < first_p then
+        last_p = first_p
+        last_w = first_w
+    end
+    local span = last_w - first_w + 1
+    if span <= 2 and #words > 6 and first_w > 3 and last_w < #words - 2 then
+        return nil
+    end
+    return first_w, last_w, toks[first_p].a, toks[last_p].b
+end
+
+--- Split on whitespace. UTF-8 safe (does not slice codepoints).
+function Utils.splitWords(s)
+    local words = {}
+    if not s or s == "" then return words end
+    for w in s:gmatch("%S+") do
+        words[#words + 1] = w
+    end
+    return words
+end
+
+--- True when an overlay timing entry can take part in a merged highlight.
+-- Requires the same fields the fragment-id highlight path needs: a resolvable
+-- SMIL fragment, its content document, and real span text. A raw text_ref
+-- (span extraction failed) leaks into `.text` as a path containing "#";
+-- prose never contains that, so it is rejected here.
+local function cueMergeable(e)
+    if not e then return false end
+    if not e.fragment_id or not e.text_doc then return false end
+    if type(e.text) ~= "string" then return false end
+    if Utils.ws(e.text) == "" then return false end
+    if e.text:find("#", 1, true) then return false end
+    return true
+end
+
+--- Partition an overlay timing slice into visual highlight groups.
+-- E-ink cannot repaint for every short SMIL cue, so consecutive short cues
+-- are merged into one highlight unit that stays on screen at least
+-- `threshold_s`. Contiguous index ranges over 1..#timing:
+--   groups:      array of {first=i, last=j} in order
+--   entry_group: map entry index -> 1-based group index
+-- A group extends only while the NEXT cue is short on its own (a long cue
+-- keeps its own visual unit), the span so far is under the threshold (so the
+-- final span reaches it), same content document, and both cues are
+-- mergeable. Non-mergeable entries become singletons and break runs, so a
+-- merged group's text is never empty. `max_members` bounds the group size:
+-- books with runs of near-zero-length cues would otherwise absorb dozens of
+-- entries into one giant flash-chunk. Returns nil, nil when there is
+-- nothing to group (empty input).
+-- @param timing table  Timing entries ({start_time, end_time, text, ...})
+-- @param threshold_s number  Minimum on-screen duration of a merged group
+-- @param max_members number  Optional cap on cues per group (default 8)
+-- @return table|nil, table|nil
+function Utils.buildCueGroups(timing, threshold_s, max_members)
+    local n = timing and #timing or 0
+    if n == 0 then return nil, nil end
+    if not max_members or max_members < 1 then max_members = 8 end
+
+    local groups, entry_group = {}, {}
+    local i = 1
+    while i <= n do
+        local first, last = i, i
+        if cueMergeable(timing[i]) then
+            local t0 = timing[i].start_time or 0
+            while last < n do
+                if last - first + 1 >= max_members then break end
+                local cand = timing[last + 1]
+                if not cueMergeable(cand) then break end
+                if cand.text_doc ~= timing[first].text_doc then break end
+                local cand_dur = (cand.end_time or 0) - (cand.start_time or 0)
+                if cand_dur > threshold_s then break end
+                -- Span BEFORE the candidate: the cue that reaches the
+                -- threshold is the last one absorbed, so a merged group's
+                -- on-screen lifetime never falls short of it.
+                local span = (timing[last].end_time or 0) - t0
+                if span >= threshold_s then break end
+                last = last + 1
+            end
+        end
+        groups[#groups + 1] = { first = first, last = last }
+        for j = first, last do
+            entry_group[j] = #groups
+        end
+        i = last + 1
+    end
+    return groups, entry_group
+end
+
+--- Longest prefix of `words` that appears as a contiguous phrase in `page`.
+function Utils.wordPrefixCount(words, page)
+    if not words or #words == 0 or not page or page == "" then return 0 end
+    local lo, hi = 0, #words
+    while lo < hi do
+        local mid = math.floor((lo + hi + 1) / 2)
+        local prefix = table.concat(words, " ", 1, mid)
+        if page:find(prefix, 1, true) then
+            lo = mid
+        else
+            hi = mid - 1
+        end
+    end
+    return lo
+end
+
+--- Index of the first word that contains a letter/digit (skip leading punctuation).
+function Utils.contentWordStart(words)
+    if not words then return 1 end
+    for i = 1, #words do
+        if not words[i]:match("^%p+$") then return i end
+    end
+    return 1
+end
+
+--- Longest prefix of `words` on `page`, ignoring a leading punctuation token.
+function Utils.sentencePrefixOnPage(words, page)
+    if not words or #words == 0 or not page or page == "" then return 0 end
+    local start = Utils.contentWordStart(words)
+    if start == 1 then
+        return Utils.wordPrefixCount(words, page)
+    end
+    local rest = {}
+    for i = start, #words do
+        rest[#rest + 1] = words[i]
+    end
+    local n = Utils.wordPrefixCount(rest, page)
+    if n <= 0 then return 0 end
+    return n + start - 1
+end
+
+--- Longest suffix of `words` that appears as a contiguous phrase in `page`.
+-- Used after a mid-sentence page turn: only the tail is on screen.
+function Utils.sentenceSuffixOnPage(words, page)
+    if not words or #words == 0 or not page or page == "" then return 0 end
+    for n = #words, 1, -1 do
+        local suffix = table.concat(words, " ", #words - n + 1, #words)
+        if page:find(suffix, 1, true) then
+            return n
+        end
+    end
+    return 0
+end
+
+--- First and last sentence-word indices of the longest contiguous run of
+--- `words` that appears in `page`. nil when nothing matches.
+--- Prefers the longest *span* (not the match that ends furthest): a later
+--- one-word coincidence like "de" must not replace a 12-word prefix.
+function Utils.visibleSentenceWordRange(words, page)
+    if not words or #words == 0 or not page or page == "" then return nil end
+    local best_i, best_j = nil, nil
+    local function consider(i, j)
+        if not i or not j or j < i then return end
+        local span = j - i + 1
+        local best_span = (best_i and (best_j - best_i + 1)) or 0
+        if span > best_span or (span == best_span and i < best_i) then
+            best_i, best_j = i, j
+        end
+    end
+    local prefix = Utils.sentencePrefixOnPage(words, page)
+    if prefix > 0 then
+        consider(1, prefix)
+        if prefix >= #words then return 1, #words end
+    end
+    for i = (prefix > 0 and prefix + 1 or 1), #words do
+        local lo, hi = 0, #words - i + 1
+        while lo < hi do
+            local mid = math.floor((lo + hi + 1) / 2)
+            local slice = table.concat(words, " ", i, i + mid - 1)
+            if page:find(slice, 1, true) then
+                lo = mid
+            else
+                hi = mid - 1
+            end
+        end
+        if lo > 0 then
+            consider(i, i + lo - 1)
+        end
+    end
+    if not best_i then return nil end
+    return best_i, best_j
+end
+
+-- Spaceless-script detection as raw UTF-8 byte patterns (no unicode library).
+-- Same block coverage as TTSEngine's CJK detection (Han, Kana, Hangul); the
+-- patterns are duplicated here because utils is a leaf module ttsengine cannot
+-- be required from.  Korean words carry spaces, but Korean also allows breaking
+-- a word across lines, which hits the same wrap case as Han/Kana.
+local RE_HAN    = "[\228-\233][\128-\191][\128-\191]"
+local RE_KANA   = "\227[\129-\131][\128-\191]"
+local RE_HANGUL = "[\234-\237][\128-\191][\128-\191]"
+
+--- True when `s` contains at least one Han, Kana, or Hangul codepoint, i.e.
+--- a script written without spaces between words.  Used to gate the
+--- whitespace-insensitive sentence match (findIgnoringSpaces): for a spaced
+--- script an exact-match miss means the sentence is not on the page at all,
+--- so a space-insensitive hit could only be a mid-word coincidence.  For a
+--- spaceless script the usual cause of an exact miss is a line wrap.
+-- @param s string
+-- @return boolean
+function Utils.hasSpacelessScript(s)
+    if not s or s == "" then return false end
+    if s:find(RE_HAN) then return true end
+    if s:find(RE_KANA) then return true end
+    if s:find(RE_HANGUL) then return true end
+    return false
+end
+
+--- Largest byte offset <= n that ends a complete UTF-8 character in `s`.
+--- Cutting a string at a byte offset that lands inside a multi-byte
+--- character leaves that character's continuation bytes at the start of
+--- the remainder: on a page turn that re-reads part of a CJK character
+--- (heard as one character repeated) or drops it into mojibake.  Used
+--- wherever a matched byte length is turned into a substring cut.
+-- @param s string
+-- @param n number  Candidate byte offset (0..#s)
+-- @return number   Offset with a character boundary after it
+function Utils.snapToCharBoundary(s, n)
+    if not s or n <= 0 then return 0 end
+    if n >= #s then return #s end
+    local i = n + 1
+    while i > 1 do
+        local b = s:byte(i)
+        if b and b >= 0x80 and b < 0xC0 then
+            i = i - 1   -- continuation byte: step back into the character
+        else
+            break
+        end
+    end
+    return i - 1
+end
+
+--- Re-anchor a "read from here" suffix in page text captured after the
+--- layout settled.  Starting read-aloud inserts the playback bar, the
+--- reader re-lays out the page, and the suffix sliced before that reflow
+--- can begin at a sentence that no longer sits on the visible page: the
+--- highlight then matches nothing and the auto-advance skips text
+--- (issue #96: a from-here sentence jumped to the previous page).
+-- @param fresh string     Page text captured after the reflow
+-- @param captured string  Suffix captured before the reflow
+-- @return string|nil      Text to read instead, or nil to keep `captured`
+function Utils.reanchorFromHere(fresh, captured)
+    if not fresh or fresh == "" or not captured or captured == "" then
+        return nil
+    end
+    -- A byte cap, snapped so the probe never ends inside a character.
+    local anchor = captured:sub(1, Utils.snapToCharBoundary(captured, 40))
+    if #anchor >= 6 then
+        local a = Utils.findIgnoringSpaces(fresh, Utils.ws(anchor))
+        if a then
+            local anchored = fresh:sub(a)
+            if Utils.ws(anchored) == Utils.ws(captured) then
+                return nil   -- same place, same text: nothing to do
+            end
+            return anchored
+        end
+    end
+    -- Not on the settled page at all: reading from the top of what is
+    -- actually visible beats driving a highlight against absent text.
+    if Utils.ws(fresh) ~= Utils.ws(captured) then
+        return fresh
+    end
+    return nil
+end
+
+--- Find `needle` inside `haystack` while IGNORING all whitespace, returning
+--- the (1-based, inclusive) byte range in the ORIGINAL haystack, or nil.
+---
+--- Why this exists: `_highlightSentenceRolling` builds `built_text` by
+--- concatenating rendered line texts, inserting a single space at every line
+--- break.  A CJK sentence has no internal spaces, so when it wraps across two
+--- rendered lines the inserted space makes a plain `find(sentence)` miss, and
+--- the word-level fallbacks degenerate (splitWords treats the whole sentence
+--- as one token).  This matcher compares both strings with ASCII whitespace
+--- removed and maps the hit back onto the original haystack, so a phrase that
+--- merely wrapped is still found.
+---
+--- Text is compared byte-wise; only bytes Lua's "%s" matches (space, \t, \n,
+--- \v, \f, \r) are skipped, and those never occur inside a multi-byte UTF-8
+--- sequence, so codepoint alignment is preserved and `find`'s hit is always
+--- codepoint-aligned.  Needles stripping to fewer than 6 bytes are rejected:
+--- a very short needle ("好。") could otherwise match inside a different
+--- sentence on the page and highlight the wrong region.
+--- @param haystack string  Rendered page text (with line-break spaces)
+--- @param needle string    Sentence text (whitespace runs collapsed)
+--- @return number|nil start, number|nil end  Byte range in `haystack`
+function Utils.findIgnoringSpaces(haystack, needle)
+    if not haystack or not needle or needle == "" then return nil end
+
+    -- Reject if the needle has no non-space content or is very short.
+    local needle_stripped = needle:gsub("%s+", "")
+    if #needle_stripped < 6 then return nil end
+
+    -- Walk `haystack`, dropping whitespace, and record for every kept
+    -- codepoint: its byte offset in the stripped string AND its original
+    -- byte range in haystack.  The map must be keyed by BYTE offset (`find`
+    -- returns a byte position), so keep one entry per stripped byte.
+    local stripped = {}
+    local strip_byte = {}   -- stripped byte offset (1-based) -> { s = , e = }
+    local n = #haystack
+    local i = 1
+    local so = 0            -- running byte length of the stripped string
+    while i <= n do
+        local b = haystack:byte(i)
+        if b == 0x20 or (b >= 0x09 and b <= 0x0D) then
+            i = i + 1
+        else
+            -- Copy one full UTF-8 codepoint so multibyte chars stay intact.
+            local len = 1
+            if b >= 0xF0 then len = 4
+            elseif b >= 0xE0 then len = 3
+            elseif b >= 0xC0 then len = 2 end
+            stripped[#stripped + 1] = haystack:sub(i, i + len - 1)
+            -- Map every byte of this codepoint back to its original range.
+            for k = 1, len do
+                strip_byte[so + k] = { s = i, e = i + len - 1 }
+            end
+            so = so + len
+            i = i + len
+        end
+    end
+    local hay_stripped = table.concat(stripped)
+
+    local p = hay_stripped:find(needle_stripped, 1, true)
+    if not p then return nil end
+    local q = p + #needle_stripped - 1       -- byte range in the stripped string
+    local start_entry = strip_byte[p]
+    local end_entry = strip_byte[q]
+    if not start_entry or not end_entry then return nil end
+    return start_entry.s, end_entry.e
+end
+
+--- Decode the UTF-8 codepoint starting at byte i.
+--- Codepoint-aligned input is assumed (the callers walk lead bytes only);
+--- a continuation byte met here returns the byte value itself.
+-- @param s string  Input text
+-- @param i number  Byte offset (1-based)
+-- @return number codepoint, number next byte offset
+function Utils.decodeCharAt(s, i)
+    local b = s:byte(i)
+    if not b then return nil, i + 1 end
+    if b < 0x80 then return b, i + 1 end
+    local len, cp
+    if b >= 0xC2 and b <= 0xDF then len, cp = 2, b - 0xC0
+    elseif b >= 0xE0 and b <= 0xEF then len, cp = 3, b - 0xE0
+    elseif b >= 0xF0 and b <= 0xF4 then len, cp = 4, b - 0xF0
+    else return b, i + 1 end
+    for k = 1, len - 1 do
+        local cb = s:byte(i + k)
+        if not cb or cb < 0x80 or cb >= 0xC0 then return b, i + 1 end
+        cp = cp * 64 + (cb - 0x80)
+    end
+    return cp, i + len
+end
+
+--- True when the text contains CJK ideographs, kana, or their compatibility
+--- forms.  Korean is deliberately excluded: hangul text uses spaces, so the
+--- word-count heuristics keep working for it.
+-- @param s string
+-- @return boolean
+function Utils.hasCJKScript(s)
+    if not s or s == "" then return false end
+    local i = 1
+    while i <= #s do
+        local cp, next_i = Utils.decodeCharAt(s, i)
+        if cp and cp >= 0x3000 then
+            -- CJK punctuation (0x3000-0x303F), kana (0x3040-0x30FF), CJK
+            -- ext-A (0x3400-0x4DBF), unified ideographs (0x4E00-0x9FFF),
+            -- compatibility ideographs (0xF900-0xFAFF), halfwidth kana
+            -- (0xFF66-0xFF9D).
+            if (cp <= 0x30FF)
+                or (cp >= 0x3400 and cp <= 0x4DBF)
+                or (cp >= 0x4E00 and cp <= 0x9FFF)
+                or (cp >= 0xF900 and cp <= 0xFAFF)
+                or (cp >= 0xFF66 and cp <= 0xFF9D) then
+                return true
+            end
+        end
+        i = next_i or (i + 1)
+    end
+    return false
+end
+
+--- Count non-whitespace characters (codepoints, not bytes).  For spaceless
+--- scripts a whole sentence is one "%S+" token, so word counts are useless;
+--- character counts stand in for them.
+-- @param s string
+-- @return number
+function Utils.charCount(s)
+    if not s or s == "" then return 0 end
+    local n = 0
+    local i = 1
+    while i <= #s do
+        local cp, next_i = Utils.decodeCharAt(s, i)
+        if cp and not (cp == 0x20 or (cp >= 0x09 and cp <= 0x0D)) then
+            n = n + 1
+        end
+        i = next_i or (i + 1)
+    end
+    return n
+end
+
+--[[--
+Decide whether a page's last, unterminated sentence should absorb the next
+page's first sentence (the page-boundary wrap carry).
+
+The Latin heuristic stands: a continuation that starts lowercase is a wrapped
+clause (carry it); otherwise demand a reasonably long last line so headings
+do not swallow the next sentence.  For spaceless scripts (Chinese, Japanese)
+neither test can work: nothing is ever lowercase and every sentence is a
+single whitespace token, so the old guard refused the carry for every CJK
+page and cut each sentence straddling the page break (issue #96).  There the
+capitalization test is dropped and a character-count threshold stands in for
+the word count: cut prose lines run long, bare headings are short.
+
+-- @param last_text string   Last sentence on the page (no terminator)
+-- @param first_text string  First sentence on the next page
+-- @return boolean           true when the carry should proceed
+--]]
+function Utils.shouldCarryPageBoundary(last_text, first_text)
+    if Utils.hasCJKScript(first_text) or Utils.hasCJKScript(last_text) then
+        return Utils.charCount(last_text) >= 6
+    end
+    -- Latin path (kept byte-compatible with the old synccontroller guard).
+    local s = first_text or ""
+    s = s:gsub("^[%s\"']+", "")
+    s = s:gsub("^\194[\171\187]+", "") -- « »
+    s = s:gsub("^\226\128[\147-\159]+", "") -- dashes / curly quotes
+    s = s:gsub("^[%-%s]+", "")
+    local b1, b2 = s:byte(1, 2)
+    local starts_lower = false
+    if b1 then
+        if b1 >= 97 and b1 <= 122 then
+            starts_lower = true
+        elseif b1 == 195 and b2 and b2 >= 160 and b2 <= 191 and b2 ~= 183 then
+            starts_lower = true
+        end
+    end
+    if starts_lower then return true end
+    local n = 0
+    for _ in (last_text or ""):gmatch("%S+") do n = n + 1 end
+    return n >= 4
+end
+
+--- Detect the number of CPU cores (same logic as piperqueue.lua).
+-- @return number  Core count (1 when undetectable)
+function Utils.getCpuCores()
+    local f = io.open("/sys/devices/system/cpu/possible", "r")
+    if f then
+        -- Format: "0-N" → N+1 cores, or "0" → 1 core
+        local s = f:read("*l") or "0"
+        f:close()
+        local hi = s:match("%-(%d+)")
+        if hi then return tonumber(hi) + 1 end
+        return 1
+    end
+    return 1  -- conservative fallback
+end
+
+--- Read total system memory in kB from /proc/meminfo.
+-- @return number|nil  MemTotal in kB, or nil when unreadable
+function Utils.getMemTotalKb()
+    local f = io.open("/proc/meminfo", "r")
+    if not f then return nil end
+    for line in f:lines() do
+        local kb = line:match("MemTotal:%s+(%d+)%s+kB")
+        if kb then
+            f:close()
+            return tonumber(kb)
+        end
+    end
+    f:close()
+    return nil
+end
+
+return Utils
